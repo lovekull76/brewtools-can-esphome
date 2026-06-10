@@ -5,6 +5,8 @@ ESPHome firmware that bridges [Brewtools](https://brewtools.com) CAN bus devices
 Brewtools' native CAN protocol. It lets you read specific gravity, wort temperature and RPM,
 drive the agitator, and calibrate the density meter, all from Home Assistant.
 
+![The finished Brewtools CAN controller](images/box_closed.jpeg)
+
 > ⚠️ **Not affiliated with Brewtools.** This is a community project built from Brewtools'
 > public ["CAN devices on other platforms"](https://docs.brewtools.com/sensors/can-devices-on-other-platforms)
 > documentation. Talking to hardware over a third-party integration can misbehave — **use at
@@ -55,6 +57,10 @@ LP12:    PIN1 (red)   +24V     PIN2 (yellow) CAN H
 - The Brewtools devices have no internal termination; they hang as short stubs between the two
   bus ends. Keep stubs short (<30 cm) at 1 Mbps.
 
+The second 120 Ω terminator soldered into the far end of the bus cable:
+
+![120 Ω terminator at the far end of the bus cable](images/termination_cable_end.jpeg)
+
 ## CAN protocol (summary)
 
 1 Mbps, 29-bit extended IDs. ID layout:
@@ -84,6 +90,8 @@ Full reference: [Brewtools docs](https://docs.brewtools.com/sensors/can-devices-
 
 ## Home Assistant entities
 
+![The controller in Home Assistant](images/hass.PNG)
+
 - **Agitator** (switch), **Agitator PWM** (number, %), **Agitator RPM** (sensor)
 - **Specific gravity**, **Wort temperature**
 - **Density reference SG** (number), **Calibrate density** (button),
@@ -101,6 +109,25 @@ Single-point calibration to a known reference SG:
 3. Press **Calibrate density** and watch **Density calibration status** go `Calibrating → OK`.
 
 The reference SG is persisted across reboots. Calibrate at a stable, known temperature.
+
+## Enclosure (3D-printed case)
+
+STEP files for the printed case are in [`cad/`](cad/) (GitHub shows them in an interactive 3D
+viewer):
+
+- [Box](cad/Brewtools%20CAN%20controller%20box.STEP)
+- [Lid](cad/Brewtools%20CAN%20controller%20box%20lid.STEP)
+
+| ![Open enclosure](images/box_open_1.jpeg) | ![Open enclosure, other angle](images/box_open_2.jpeg) |
+|:---:|:---:|
+
+![The controller next to a Brewtools agitator, for scale](images/box_and_agitator.jpeg)
+
+Design notes (see also [`cad/README.md`](cad/README.md)):
+- Keep the C3-Zero's ceramic antenna end clear of metal/copper.
+- Add a light pipe/window over the onboard WS2812 (GPIO10) so the status LED shows through.
+- For the wet brewing environment: conformal coating and/or a breather vent, and route cable
+  glands downward so condensation drains away from the electronics.
 
 ## Gotchas / lessons learned
 
