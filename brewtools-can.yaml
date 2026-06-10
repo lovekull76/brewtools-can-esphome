@@ -15,7 +15,7 @@ substitutions:
   # GPIO20/21 sit away from the ceramic antenna. Avoid GPIO18/19 (native USB).
   can_tx_pin: GPIO21         # -> SN65HVD230 D / CAN_TX
   can_rx_pin: GPIO20         # -> SN65HVD230 R / CAN_RX
-  build_tag: "2026-06-10-persist-sync"   # BUMP this per flash -> shows up in HA ("Firmware build")
+  build_tag: "2026-06-10-last-cal"   # BUMP this per flash -> shows up in HA ("Firmware build")
 
 esphome:
   name: ${name}
@@ -75,6 +75,11 @@ wifi:
     password: !secret fallback_ap_password
 
 captive_portal:
+
+# Time from Home Assistant – used to stamp the last successful density calibration.
+time:
+  - platform: homeassistant
+    id: ha_time
 
 # --- Status RGB (onboard WS2812 on GPIO10, Waveshare C3-Zero) ----------------
 # Pure status indicator (internal: true -> no HA entity, we drive it ourselves).
@@ -238,6 +243,10 @@ canbus:
                   const char* s = ack==2 ? "OK" : ack==1 ? "Calibrating" : ack==3 ? "Error" : "Unknown";
                   ESP_LOGI("brewtools", "Calibration status (node %u): %s", sender, s);
                   id(density_cal_status).publish_state(s);
+                  if (ack == 2 && id(ha_time).now().is_valid()) {   // stamp last successful cal
+                    id(cal_epoch) = (uint32_t) id(ha_time).now().timestamp;
+                    id(persist)->execute();
+                  }
                 }
               }
 
@@ -246,6 +255,10 @@ globals:
   - id: bt_rx_count
     type: uint32_t
     restore_value: no
+    initial_value: '0'
+  - id: cal_epoch           # epoch of the last successful density calibration (persisted)
+    type: uint32_t
+    restore_value: yes
     initial_value: '0'
 
 sensor:
@@ -315,6 +328,14 @@ text_sensor:
     name: "Density calibration status"
     id: density_cal_status
     icon: mdi:check-decagram
+  # Timestamp of the last successful calibration – survives reboot via cal_epoch.
+  - platform: template
+    name: "Last calibration"
+    icon: mdi:calendar-check
+    update_interval: 60s
+    lambda: |-
+      if (id(cal_epoch) == 0) return std::string("never");
+      return ESPTime::from_epoch_local((time_t) id(cal_epoch)).strftime("%Y-%m-%d %H:%M");
 
 binary_sensor:
   - platform: status
