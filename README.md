@@ -90,7 +90,8 @@ Full reference: [Brewtools docs](https://docs.brewtools.com/sensors/can-devices-
 
 ## Home Assistant entities
 
-![The controller in Home Assistant](images/hass.PNG)
+| ![The controller in Home Assistant](images/hass.jpeg) | ![Home Assistant controls](images/hass_2.jpeg) |
+|:---:|:---:|
 
 - **Agitator** (switch), **Agitator PWM** (number, %), **Agitator RPM** (sensor)
 - **Specific gravity**, **Wort temperature**
