@@ -1,50 +1,18 @@
 # Brewtools CAN – ESPHome controller
 #
-# Hardware:
-#   - ESP32-C3 (Waveshare C3-Zero, runs as esp32-c3-devkitm-1 + variant esp32c3)
-#   - Waveshare SN65HVD230 CAN board (3.3 V transceiver, FIXED 120 Ohm termination onboard)
-#   - LM2596S step-down 24 V -> 5 V (feeds the C3's 5V pin). ADJUSTABLE module:
-#     set the trimpot to exactly 5.0 V with a multimeter on OUT *before* connecting the C3.
-#     (Switched from SparkFun BabyBuck – 4 units burned and shorted GND/Vin/5V at 24 V.)
+# Bridges Brewtools CAN devices (density meter + agitator) to Home Assistant on an ESP32-C3.
+# No Brewtools FCS needed. Hardware, wiring (incl. LP12 pinout), BOM and troubleshooting are
+# in the README: https://github.com/lovekull76/brewtools-can-esphome
 #
-# Wiring:
-#   Power:        24 V PSU + -> buck VIN+,  24 V - -> buck GND
-#                 buck 5V OUT -> C3 5V,      buck GND -> C3 GND
-#                 C3 3V3 OUT  -> SN65HVD230 VCC,  C3 GND -> SN65HVD230 GND
-#   CAN (TTL):    C3 GPIO21 (TX) -> SN65HVD230 CAN_TX / "D" (driver input)
-#                 C3 GPIO20 (RX) -> SN65HVD230 CAN_RX / "R" (receiver output)
-#                 (GPIO20/21 sit away from the ceramic antenna; GPIO18/19 = USB, avoid.)
-#   CAN (bus):    SN65HVD230 CANH/CANL -> branch out to density meter + agitator.
-#                 Our module has a fixed 120 Ohm -> place it at one end of the bus, keep
-#                 the stubs to the devices short (<30 cm) at 1 Mbps.
-#   LP12 plug:    PIN1 (red)   +24V    PIN2 (yellow) CAN H   PIN3 (white) CAN L
-#                 PIN4 (green) NC      PIN5 (black)  GND
-#                 -> PIN1/PIN5 to buck VIN+/VIN-, PIN2/PIN3 to the transceiver's CANH/CANL.
-#
-# === TRANSMIT (enabled) ===
-#   The "Agitator PWM" box + "Agitator" switch send MSG_TYPE_PWM (27) to the agitator (node 6).
-#   Safe because at least one BT device is on the bus and ACKs frames.
-#   WARNING: if you unplug ALL devices the controller is the only node -> a sent frame gets
-#   no ACK -> the TWAI error counter climbs -> "bus-off". So don't transmit on an empty bus.
-#
-# Status: agitator (node 6) live on CAN – RPM sensor + PWM control + on/off, state persists
-#   across power loss. Density meter (node 4) is the next device to add.
-#
-# Troubleshooting:
-#   1. "no ack"/bus-off in the log -> you're transmitting with no BT device answering, or
-#      the bus is empty. Otherwise: check CANH/CANL not swapped and termination.
-#   2. No frames received -> verify 1 Mbps (BT is fixed at 1 Mbps), GPIO20/21 not swapped
-#      (TX<->RX), common GND between all nodes, and that the devices have 24 V.
-#   3. Buck runs hot -> measure VOUT under load; log "ESP internal temperature" as a proxy.
-#   4. Agitator ignores CAN PWM despite bus traffic -> did you press its MANUAL button?
-#      Local control locks out CAN until the device is power-cycled (24 V off/on).
+# Quick reference:
+#   - CAN TTL:  GPIO21 (TX) -> SN65HVD230 "D",  GPIO20 (RX) -> SN65HVD230 "R",  VCC = 3.3 V
+#   - Bus:      1 Mbps; fixed 120 Ω on the transceiver board + 120 Ω at the far end = 60 Ω
+#   - Buck:     LM2596 is ADJUSTABLE – set OUT to exactly 5.0 V *before* connecting the C3.
 
 substitutions:
   name: brewtools-can
   friendly_name: Brewtools CAN
-  # GPIO20/21 (UART0, unused since we log over USB) at the far end from the ceramic antenna.
-  # NOTE: avoid GPIO18/19 = native USB (D-/D+), needed for flash/log. Swap tx<->rx if the
-  # physical routing is nicer the other way (a TX/RX swap is the first thing to try anyway).
+  # GPIO20/21 sit away from the ceramic antenna. Avoid GPIO18/19 (native USB).
   can_tx_pin: GPIO21         # -> SN65HVD230 D / CAN_TX
   can_rx_pin: GPIO20         # -> SN65HVD230 R / CAN_RX
   build_tag: "2026-06-10-persist-sync"   # BUMP this per flash -> shows up in HA ("Firmware build")
@@ -192,9 +160,8 @@ script:
                       effect: "breathe"   # red = no wifi
 
 # --- Polled status LED -------------------------------------------------------
-# Reflects the ACTUAL state every 2 s (more robust than edge triggers, which could get stuck
-# on red after a wifi flap even once the link recovered).
-# (Calling light.turn_on with an unchanged colour/effect is a no-op -> no flicker.)
+# Re-applies the status colour every 2 s (robust against missed edge events; setting the same
+# colour/effect is a no-op, so no flicker).
 interval:
   - interval: 2s
     then:
@@ -310,8 +277,7 @@ sensor:
     accuracy_decimals: 4
     state_class: measurement
     icon: mdi:cup-water     # request-driven (msg 33) -> no throttle needed
-  # Uptime = reliable heartbeat. Ticks up every 30 s; if the number stalls in HA the device
-  # is gone even if "online" lingers a while. Better than guessing.
+  # Uptime = reliable heartbeat: if it stalls in HA, the device is really gone.
   - platform: uptime
     name: "Uptime"
     update_interval: 30s
@@ -325,9 +291,7 @@ sensor:
     name: "WiFi RSSI"
     update_interval: 60s
     entity_category: diagnostic
-  # Count of received CAN frames – 0 on a dry run with no devices, >0 as soon as a BT device
-  # starts talking. (Diagnostic for now; make it a regular sensor later if you want CAN
-  # activity visible on the dashboard.)
+  # Count of received CAN frames – a simple bus-activity indicator.
   - platform: template
     name: "CAN frames received"
     accuracy_decimals: 0
@@ -422,9 +386,8 @@ switch:
       - script.execute: persist
 
 # --- Density meter (node 4) --------------------------------------------------
-# Temperature (msg 12) streams on its own; SG/density (msg 14) only arrives after we send a
-# START_MEASUREMENT request (msg 33). Press the button to request one SG reading. (A periodic
-# auto-request can be added once this is confirmed working.)
+# Temperature (msg 12) streams on its own; SG/density (msg 14) only arrives after a
+# START_MEASUREMENT request (msg 33). Press the button to request one SG reading.
 button:
   - platform: template
     name: "Start density measurement"
