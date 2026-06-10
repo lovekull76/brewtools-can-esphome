@@ -5,6 +5,10 @@ ESPHome firmware that bridges [Brewtools](https://brewtools.com) CAN bus devices
 Brewtools' native CAN protocol. It lets you read specific gravity, wort temperature and RPM,
 drive the agitator, and calibrate the density meter, all from Home Assistant.
 
+**No Brewtools FCS module is required** — this controller plus the CAN devices is the entire
+setup, and the bus runs standalone. A Brewtools FCS is only needed if you want to update the
+*firmware* on the nodes themselves, which isn't something done during normal operation.
+
 ![The finished Brewtools CAN controller](images/box_closed.jpeg)
 
 > ⚠️ **Not affiliated with Brewtools.** This is a community project built from Brewtools'
