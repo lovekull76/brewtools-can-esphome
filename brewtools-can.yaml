@@ -47,7 +47,7 @@ substitutions:
   # physical routing is nicer the other way (a TX/RX swap is the first thing to try anyway).
   can_tx_pin: GPIO21         # -> SN65HVD230 D / CAN_TX
   can_rx_pin: GPIO20         # -> SN65HVD230 R / CAN_RX
-  build_tag: "2026-06-10-cal-latch"   # BUMP this per flash -> shows up in HA ("Firmware build")
+  build_tag: "2026-06-10-persist-sync"   # BUMP this per flash -> shows up in HA ("Firmware build")
 
 esphome:
   name: ${name}
@@ -150,6 +150,14 @@ script:
                      (uint8_t) ((v >> 16) & 0xFF),
                      (uint8_t) ((v >> 8)  & 0xFF),
                      (uint8_t) ( v        & 0xFF) };
+  # Force pending state (switch/number) to flash so it survives an immediate power loss,
+  # instead of waiting for the default 60 s flush. mode: restart + a short delay coalesces
+  # rapid edits (e.g. dragging PWM) into a single flash write to spare the flash.
+  - id: persist
+    mode: restart
+    then:
+      - delay: 1500ms
+      - lambda: 'global_preferences->sync();'
   # Sets the status colour from the ACTUAL current state (called by the poll loop every 2 s).
   - id: set_status
     mode: restart
@@ -373,6 +381,7 @@ number:
             - script.execute:
                 id: send_pwm
                 duty: !lambda 'return (int) x;'
+      - script.execute: persist
 
   # Reference SG for density calibration. Just a setpoint (no send on change); the
   # "Calibrate density" button sends it. Persisted so your OG/reference survives reboot.
@@ -388,6 +397,8 @@ number:
     restore_value: true
     optimistic: true
     mode: box
+    set_action:
+      - script.execute: persist
 
 # --- Agitator on/off ---------------------------------------------------------
 # on: sends the box setpoint. off: sends 0 in the background, leaves the box untouched.
@@ -403,10 +414,12 @@ switch:
       - script.execute:
           id: send_pwm
           duty: !lambda 'return (int) id(agitator_pwm).state;'
+      - script.execute: persist
     turn_off_action:
       - script.execute:
           id: send_pwm
           duty: 0
+      - script.execute: persist
 
 # --- Density meter (node 4) --------------------------------------------------
 # Temperature (msg 12) streams on its own; SG/density (msg 14) only arrives after we send a
