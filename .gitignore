@@ -1,0 +1,10 @@
+# Secrets — never commit real credentials
+secrets.yaml
+
+# ESPHome build artifacts
+.esphome/
+*.bin
+
+# OS cruft
+.DS_Store
+Thumbs.db

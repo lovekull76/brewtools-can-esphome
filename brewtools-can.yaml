@@ -1,0 +1,441 @@
+# Brewtools CAN – ESPHome controller
+#
+# Hardware:
+#   - ESP32-C3 (Waveshare C3-Zero, runs as esp32-c3-devkitm-1 + variant esp32c3)
+#   - Waveshare SN65HVD230 CAN board (3.3 V transceiver, FIXED 120 Ohm termination onboard)
+#   - LM2596S step-down 24 V -> 5 V (feeds the C3's 5V pin). ADJUSTABLE module:
+#     set the trimpot to exactly 5.0 V with a multimeter on OUT *before* connecting the C3.
+#     (Switched from SparkFun BabyBuck – 4 units burned and shorted GND/Vin/5V at 24 V.)
+#
+# Wiring:
+#   Power:        24 V PSU + -> buck VIN+,  24 V - -> buck GND
+#                 buck 5V OUT -> C3 5V,      buck GND -> C3 GND
+#                 C3 3V3 OUT  -> SN65HVD230 VCC,  C3 GND -> SN65HVD230 GND
+#   CAN (TTL):    C3 GPIO21 (TX) -> SN65HVD230 CAN_TX / "D" (driver input)
+#                 C3 GPIO20 (RX) -> SN65HVD230 CAN_RX / "R" (receiver output)
+#                 (GPIO20/21 sit away from the ceramic antenna; GPIO18/19 = USB, avoid.)
+#   CAN (bus):    SN65HVD230 CANH/CANL -> branch out to density meter + agitator.
+#                 Our module has a fixed 120 Ohm -> place it at one end of the bus, keep
+#                 the stubs to the devices short (<30 cm) at 1 Mbps.
+#   LP12 plug:    PIN1 (red)   +24V    PIN2 (yellow) CAN H   PIN3 (white) CAN L
+#                 PIN4 (green) NC      PIN5 (black)  GND
+#                 -> PIN1/PIN5 to buck VIN+/VIN-, PIN2/PIN3 to the transceiver's CANH/CANL.
+#
+# === TRANSMIT (enabled) ===
+#   The "Agitator PWM" box + "Agitator" switch send MSG_TYPE_PWM (27) to the agitator (node 6).
+#   Safe because at least one BT device is on the bus and ACKs frames.
+#   WARNING: if you unplug ALL devices the controller is the only node -> a sent frame gets
+#   no ACK -> the TWAI error counter climbs -> "bus-off". So don't transmit on an empty bus.
+#
+# Status: agitator (node 6) live on CAN – RPM sensor + PWM control + on/off, state persists
+#   across power loss. Density meter (node 4) is the next device to add.
+#
+# Troubleshooting:
+#   1. "no ack"/bus-off in the log -> you're transmitting with no BT device answering, or
+#      the bus is empty. Otherwise: check CANH/CANL not swapped and termination.
+#   2. No frames received -> verify 1 Mbps (BT is fixed at 1 Mbps), GPIO20/21 not swapped
+#      (TX<->RX), common GND between all nodes, and that the devices have 24 V.
+#   3. Buck runs hot -> measure VOUT under load; log "ESP internal temperature" as a proxy.
+#   4. Agitator ignores CAN PWM despite bus traffic -> did you press its MANUAL button?
+#      Local control locks out CAN until the device is power-cycled (24 V off/on).
+
+substitutions:
+  name: brewtools-can
+  friendly_name: Brewtools CAN
+  # GPIO20/21 (UART0, unused since we log over USB) at the far end from the ceramic antenna.
+  # NOTE: avoid GPIO18/19 = native USB (D-/D+), needed for flash/log. Swap tx<->rx if the
+  # physical routing is nicer the other way (a TX/RX swap is the first thing to try anyway).
+  can_tx_pin: GPIO21         # -> SN65HVD230 D / CAN_TX
+  can_rx_pin: GPIO20         # -> SN65HVD230 R / CAN_RX
+  build_tag: "2026-06-10-cal-latch"   # BUMP this per flash -> shows up in HA ("Firmware build")
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # Clear marker in the log so you can see the RIGHT firmware is running after a flash.
+    - priority: -100
+      then:
+        - logger.log:
+            level: INFO
+            format: ">>> Brewtools CAN firmware build ${build_tag} running – RGB status active <<<"
+    # Power-loss recovery: after an outage the controller AND agitator reboot together, both
+    # at 0. The number/switch states are restored from flash; once the bus + agitator are up
+    # we re-send the saved PWM so the agitator resumes its previous running state on its own.
+    - priority: -200
+      then:
+        - delay: 5s          # let the bus + agitator finish booting before we command them
+        - if:
+            condition:
+              switch.is_on: agitator_power
+            then:
+              - script.execute:
+                  id: send_pwm
+                  duty: !lambda 'return (int) id(agitator_pwm).state;'
+
+# C3 + esp-idf: native USB-CDC/JTAG handles logging. The CAN bus is on its own GPIOs so the
+# UART is left untouched here.
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: esp32c3
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO          # INFO keeps the log readable; bump to DEBUG to watch CAN frames
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  encryption:
+    key: !secret bt_api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret bt_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # C3 stability: high TX power often makes the ESP32-C3 unstable and drop wifi EVEN near the
+  # AP. 8.5dB is the proven sweet spot for a stable link on the C3.
+  # power_save: light lets the radio sleep between beacons -> less continuous current and a
+  # cooler die in the sealed box; the small added latency is irrelevant for agitator control.
+  output_power: 8.5dB
+  power_save_mode: light
+  ap:
+    ssid: "${name}"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+# --- Status RGB (onboard WS2812 on GPIO10, Waveshare C3-Zero) ----------------
+# Pure status indicator (internal: true -> no HA entity, we drive it ourselves).
+# The colour is set by the poll loop below (interval), not by edge triggers:
+#   red breathe = no wifi   blue breathe = wifi OK waiting for HA   green = HA connected
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    internal: true
+    pin: GPIO10
+    num_leds: 1
+    chipset: WS2812
+    # This C3-Zero's onboard LED is RGB, not GRB: with GRB "green" lit red and vice versa
+    # (blue unaffected). Proven by green->blue->red being the normal connect sequence mirrored.
+    rgb_order: RGB
+    default_transition_length: 250ms
+    effects:
+      - pulse:
+          name: "breathe"
+          transition_length: 1s
+          update_interval: 1s
+          min_brightness: 4%
+          max_brightness: 55%
+
+script:
+  # Sends a PWM command (0-100%) to the agitator. Reused by both the PWM box and the on/off
+  # switch. ID 0x40301B = prio0 | sender8 (PLC) | recv6 | sec0 | msg27.
+  # Payload = subIndex(0) + 4-byte big-endian uint32.
+  - id: send_pwm
+    parameters:
+      duty: int
+    then:
+      - canbus.send:
+          canbus_id: bt_can
+          use_extended_id: true
+          can_id: 0x40301B
+          data: !lambda |-
+            uint32_t v = (uint32_t) duty;
+            return { (uint8_t) 0x00,
+                     (uint8_t) ((v >> 24) & 0xFF),
+                     (uint8_t) ((v >> 16) & 0xFF),
+                     (uint8_t) ((v >> 8)  & 0xFF),
+                     (uint8_t) ( v        & 0xFF) };
+  # Sets the status colour from the ACTUAL current state (called by the poll loop every 2 s).
+  - id: set_status
+    mode: restart
+    then:
+      - if:
+          condition:
+            api.connected:
+          then:
+            - light.turn_on:
+                id: status_led
+                red: 0%
+                green: 100%
+                blue: 0%
+                effect: "breathe"     # green = HA connected
+          else:
+            - if:
+                condition:
+                  wifi.connected:
+                then:
+                  - light.turn_on:
+                      id: status_led
+                      red: 0%
+                      green: 0%
+                      blue: 100%
+                      effect: "breathe"   # blue = wifi OK, waiting for HA
+                else:
+                  - light.turn_on:
+                      id: status_led
+                      red: 100%
+                      green: 0%
+                      blue: 0%
+                      effect: "breathe"   # red = no wifi
+
+# --- Polled status LED -------------------------------------------------------
+# Reflects the ACTUAL state every 2 s (more robust than edge triggers, which could get stuck
+# on red after a wifi flap even once the link recovered).
+# (Calling light.turn_on with an unchanged colour/effect is a no-op -> no flicker.)
+interval:
+  - interval: 2s
+    then:
+      - script.execute: set_status
+
+# --- CAN bus -----------------------------------------------------------------
+# ESPHome esp32_can = built-in TWAI controller + external SN65HVD230 transceiver.
+#
+# Brewtools 29-bit extended ID:
+#   priority      = (id >> 27) & 0x03
+#   senderNode    = (id >> 19) & 0xFF   (4 = density meter, 6 = agitator)
+#   receiverNode  = (id >> 11) & 0xFF
+#   secondaryId   = (id >>  8) & 0x07
+#   msgType       =  id        & 0xFF
+# Payload: data[0] = sub-index, then the value.
+#   MSG 12 = TEMPERATURE (deg C, float),  14 = DENSITY (SG, float),
+#   MSG 17 = RPM (uint32 big-endian),  27 = PWM cmd,  33 = START_MEASUREMENT cmd.
+canbus:
+  - platform: esp32_can
+    id: bt_can
+    tx_pin: ${can_tx_pin}
+    rx_pin: ${can_rx_pin}
+    bit_rate: 1000KBPS    # = 1 Mbps (ESPHome's key is 1000KBPS, not 1MBPS)
+    can_id: 0             # our source address – only used when we send (we set IDs explicitly)
+    on_frame:
+      # Match EVERYTHING (mask 0) so we see exactly what shows up on the bus.
+      - can_id: 0
+        can_id_mask: 0
+        use_extended_id: true
+        then:
+          - lambda: |-
+              const uint32_t prio   = (can_id >> 27) & 0x03;
+              const uint32_t sender = (can_id >> 19) & 0xFF;
+              const uint32_t recv   = (can_id >> 11) & 0xFF;
+              const uint32_t sec    = (can_id >>  8) & 0x07;
+              const uint32_t msg    =  can_id        & 0xFF;
+              id(bt_rx_count) += 1;
+
+              // Log throttle: BT devices stream frames continuously, so log at most every 2 s
+              // to keep the log readable (only matters at DEBUG level). HA sensors carry the
+              // real values, throttled on the sensor itself.
+              static uint32_t last_log = 0;
+              const bool do_log = (millis() - last_log) >= 2000;
+              if (do_log) last_log = millis();
+
+              if (do_log)
+                ESP_LOGD("brewtools", "ID=0x%08X prio=%u sender=%u recv=%u sec=%u msg=%u len=%u",
+                         can_id, prio, sender, recv, sec, msg, (unsigned) x.size());
+
+              // Decode known message types (x[0] = sub-index, then the value).
+              if (msg == 12 && x.size() >= 5) {        // TEMPERATURE (float deg C)
+                float v; memcpy(&v, &x[1], 4);          // ESP32 = little-endian, matches BT
+                if (do_log) ESP_LOGD("brewtools", "Temp (node %u): %.2f C", sender, v);
+                id(density_temp).publish_state(v);
+              } else if (msg == 14 && x.size() >= 5) {  // DENSITY (float SG)
+                float v; memcpy(&v, &x[1], 4);
+                if (do_log) ESP_LOGD("brewtools", "Density (node %u): %.4f SG", sender, v);
+                id(density_sg).publish_state(v);
+              } else if (msg == 17 && x.size() >= 5) {  // RPM (uint32 big-endian)
+                uint32_t rpm = ((uint32_t)x[1] << 24) | ((uint32_t)x[2] << 16) |
+                               ((uint32_t)x[3] << 8)  |  (uint32_t)x[4];
+                if (do_log) ESP_LOGD("brewtools", "RPM (node %u): %u", sender, rpm);
+                id(agitator_rpm).publish_state(rpm);
+              } else if (msg == 29) {                   // CALIBRATION_ACK – the meter broadcasts
+                // this continuously: mostly idle "None" with brief pulses of Calibrating/OK/Error.
+                // Latch only the meaningful results (ignore None) so the status stays readable:
+                // press Calibrate -> holds "Calibrating" during the wait -> sticks on OK/Error.
+                uint32_t ack = (x.size() >= 5)
+                    ? (((uint32_t)x[1]<<24)|((uint32_t)x[2]<<16)|((uint32_t)x[3]<<8)|(uint32_t)x[4])
+                    : (x.size() >= 2 ? x[1] : 0);
+                static uint32_t last_ack = 0xFFFFFFFF;
+                if (ack != 0 && ack != last_ack) {
+                  last_ack = ack;
+                  const char* s = ack==2 ? "OK" : ack==1 ? "Calibrating" : ack==3 ? "Error" : "Unknown";
+                  ESP_LOGI("brewtools", "Calibration status (node %u): %s", sender, s);
+                  id(density_cal_status).publish_state(s);
+                }
+              }
+
+# --- Diagnostics -------------------------------------------------------------
+globals:
+  - id: bt_rx_count
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+sensor:
+  # --- Brewtools readings (pushed from the CAN on_frame when devices talk) ---
+  - platform: template
+    name: "Agitator RPM"
+    id: agitator_rpm
+    unit_of_measurement: "rpm"
+    accuracy_decimals: 0
+    icon: mdi:fan
+    filters:
+      - throttle: 1s        # devices stream RPM fast; one HA update per second is plenty
+  # Density meter (node 4): temperature streams continuously; SG only updates after a
+  # START_MEASUREMENT request (see the button below).
+  - platform: template
+    name: "Wort temperature"
+    id: density_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 2
+    device_class: temperature
+    state_class: measurement
+    icon: mdi:thermometer
+    filters:
+      - throttle: 5s        # temperature streams fast; one update per 5 s is plenty
+  - platform: template
+    name: "Specific gravity"
+    id: density_sg
+    unit_of_measurement: "SG"
+    accuracy_decimals: 4
+    state_class: measurement
+    icon: mdi:cup-water     # request-driven (msg 33) -> no throttle needed
+  # Uptime = reliable heartbeat. Ticks up every 30 s; if the number stalls in HA the device
+  # is gone even if "online" lingers a while. Better than guessing.
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 30s
+    entity_category: diagnostic
+  # C3 internal temperature – proxy for board/enclosure environment.
+  - platform: internal_temperature
+    name: "ESP internal temperature"
+    update_interval: 10s
+    entity_category: diagnostic
+  - platform: wifi_signal
+    name: "WiFi RSSI"
+    update_interval: 60s
+    entity_category: diagnostic
+  # Count of received CAN frames – 0 on a dry run with no devices, >0 as soon as a BT device
+  # starts talking. (Diagnostic for now; make it a regular sensor later if you want CAN
+  # activity visible on the dashboard.)
+  - platform: template
+    name: "CAN frames received"
+    accuracy_decimals: 0
+    unit_of_measurement: "frames"
+    lambda: 'return id(bt_rx_count);'
+    update_interval: 10s
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: version
+    name: "ESPHome version"
+  # Shows which firmware build is ACTUALLY running – visible directly in HA, no boot log needed.
+  - platform: template
+    name: "Firmware build"
+    icon: mdi:tag
+    entity_category: diagnostic
+    lambda: 'return {"${build_tag}"};'
+    update_interval: 60s
+  # Result of the last density calibration (pushed from CALIBRATION_ACK, msg 29).
+  - platform: template
+    name: "Density calibration status"
+    id: density_cal_status
+    icon: mdi:check-decagram
+
+binary_sensor:
+  - platform: status
+    name: "Status"
+
+# --- Agitator control (PWM) --------------------------------------------------
+# The box = speed SETPOINT (persisted across reboot). Only sends if the agitator is ON;
+# otherwise it just updates the setpoint without touching the motor (the switch handles
+# on/off via send_pwm). Min 10% because below ~10% the motor won't start from standstill.
+number:
+  - platform: template
+    name: "Agitator PWM"
+    id: agitator_pwm
+    icon: mdi:speedometer
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 100
+    step: 1
+    initial_value: 10        # fallback before the first set / if nothing stored
+    restore_value: true      # remember the setpoint across power loss
+    optimistic: true
+    mode: box
+    set_action:
+      - if:
+          condition:
+            switch.is_on: agitator_power
+          then:
+            - script.execute:
+                id: send_pwm
+                duty: !lambda 'return (int) x;'
+
+  # Reference SG for density calibration. Just a setpoint (no send on change); the
+  # "Calibrate density" button sends it. Persisted so your OG/reference survives reboot.
+  - platform: template
+    name: "Density reference SG"
+    id: density_ref_sg
+    icon: mdi:water-check
+    unit_of_measurement: "SG"
+    min_value: 0.9900
+    max_value: 1.1500
+    step: 0.0001
+    initial_value: 1.0000
+    restore_value: true
+    optimistic: true
+    mode: box
+
+# --- Agitator on/off ---------------------------------------------------------
+# on: sends the box setpoint. off: sends 0 in the background, leaves the box untouched.
+# restore_mode remembers the on/off state across power loss (the on_boot block re-sends).
+switch:
+  - platform: template
+    name: "Agitator"
+    id: agitator_power
+    icon: mdi:fan
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - script.execute:
+          id: send_pwm
+          duty: !lambda 'return (int) id(agitator_pwm).state;'
+    turn_off_action:
+      - script.execute:
+          id: send_pwm
+          duty: 0
+
+# --- Density meter (node 4) --------------------------------------------------
+# Temperature (msg 12) streams on its own; SG/density (msg 14) only arrives after we send a
+# START_MEASUREMENT request (msg 33). Press the button to request one SG reading. (A periodic
+# auto-request can be added once this is confirmed working.)
+button:
+  - platform: template
+    name: "Start density measurement"
+    icon: mdi:play
+    on_press:
+      - canbus.send:
+          canbus_id: bt_can
+          use_extended_id: true
+          can_id: 0x402021    # (0<<27)|(8<<19)|(4<<11)|(0<<8)|33 = PLC8 -> density4, msg33
+          data: [0x00]        # data[0] = sub-index
+
+  # Calibrate the density meter to the value in "Density reference SG" (MSG_TYPE 28).
+  # Payload = subIndex(0) + IEEE-754 float SG (little-endian). Watch "Density calibration
+  # status" for the ACK (OK / Calibrating / Error).
+  - platform: template
+    name: "Calibrate density"
+    icon: mdi:tune
+    on_press:
+      - canbus.send:
+          canbus_id: bt_can
+          use_extended_id: true
+          can_id: 0x40201C    # (0<<27)|(8<<19)|(4<<11)|(0<<8)|28 = PLC8 -> density4, msg28
+          data: !lambda |-
+            float sg = id(density_ref_sg).state;
+            uint8_t b[4];
+            memcpy(b, &sg, 4);            // ESP32 little-endian, matches BT's float frames
+            return { (uint8_t) 0x00, b[0], b[1], b[2], b[3] };
