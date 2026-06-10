@@ -141,6 +141,31 @@ Design notes (see also [`cad/README.md`](cad/README.md)):
 - The agitator needs **≥ ~10 % PWM** to start from standstill, and floors at a minimum RPM.
 - High wifi TX power makes the ESP32-C3 unstable — **`output_power: 8.5dB`** gives a stable link.
 
+## Contributing / adding more Brewtools devices
+
+This project implements the two devices I actually use — the **agitator** and the **density
+meter**. Brewtools has more CAN devices on the same bus that aren't covered here, for example:
+
+- Pressure sensor (`NODE_TYPE_PRESSURE_SENSOR = 3`, `MSG_TYPE_PRESSURE = 13`)
+- Level sensor (`NODE_TYPE_LEVEL_SENSOR = 5`, `MSG_TYPE_LEVEL = 16`)
+- FCS F-IO (`NODE_TYPE_FCS_F_IO = 2`)
+
+**Forks and pull requests are very welcome** to add support for those (or any other device on
+the bus). I'm only maintaining the agitator + density meter, so forking is the natural way to
+extend it — and the patterns are simple:
+
+- **Reading a value:** decode the device's message type(s) in the `on_frame` lambda (`data[0]`
+  is the sub-index; floats are little-endian, uint32 is big-endian) and `publish_state` to a
+  new sensor — just like `Agitator RPM` / `Specific gravity`.
+- **Sending a command:** a small `canbus.send` with a 29-bit ID built as
+  `priority<<27 | senderNodeType<<19 | receiverNodeType<<11 | secondaryNodeId<<8 | msgType`
+  and a `[sub-index, value…]` payload — just like the PWM and calibration actions.
+- The full node-type and message-type list is in the
+  [Brewtools CAN docs](https://docs.brewtools.com/sensors/can-devices-on-other-platforms).
+
+If you add a device, a PR (or even just a link to your fork in an issue) is appreciated so
+others can find it.
+
 ## License
 
 [MIT](LICENSE).
