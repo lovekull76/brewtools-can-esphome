@@ -15,7 +15,7 @@ substitutions:
   # GPIO20/21 sit away from the ceramic antenna. Avoid GPIO18/19 (native USB).
   can_tx_pin: GPIO21         # -> SN65HVD230 D / CAN_TX
   can_rx_pin: GPIO20         # -> SN65HVD230 R / CAN_RX
-  build_tag: "2026-06-10-last-cal"   # BUMP this per flash -> shows up in HA ("Firmware build")
+  build_tag: "2026-06-21-sg-raw"   # BUMP this per flash -> shows up in HA ("Firmware build")
 
 esphome:
   name: ${name}
@@ -68,7 +68,7 @@ wifi:
   # AP. 8.5dB is the proven sweet spot for a stable link on the C3.
   # power_save: light lets the radio sleep between beacons -> less continuous current and a
   # cooler die in the sealed box; the small added latency is irrelevant for agitator control.
-  output_power: 8.5dB
+  # output_power: 8.5dB
   power_save_mode: light
   ap:
     ssid: "${name}"
@@ -94,7 +94,7 @@ light:
     chipset: WS2812
     # This C3-Zero's onboard LED is RGB, not GRB: with GRB "green" lit red and vice versa
     # (blue unaffected). Proven by green->blue->red being the normal connect sequence mirrored.
-    rgb_order: RGB
+    channel_colors: RGB
     default_transition_length: 250ms
     effects:
       - pulse:
@@ -221,10 +221,14 @@ canbus:
                 float v; memcpy(&v, &x[1], 4);          // ESP32 = little-endian, matches BT
                 if (do_log) ESP_LOGD("brewtools", "Temp (node %u): %.2f C", sender, v);
                 id(density_temp).publish_state(v);
-              } else if (msg == 14 && x.size() >= 5) {  // DENSITY (float SG)
-                float v; memcpy(&v, &x[1], 4);
+              } else if (msg == 14 && x.size() >= 5) {  // DENSITY = calibrated SG. Only sent when the
+                float v; memcpy(&v, &x[1], 4);          // calibration is valid (msg 15 = raw value).
                 if (do_log) ESP_LOGD("brewtools", "Density (node %u): %.4f SG", sender, v);
                 id(density_sg).publish_state(v);
+              } else if (msg == 15 && x.size() >= 5) {  // raw/uncalibrated SG (~1081 = SG x1000;
+                float v; memcpy(&v, &x[1], 4);          // -999 = no valid reading). Kept for interest.
+                if (do_log) ESP_LOGD("brewtools", "Raw SG (node %u): %.1f", sender, v);
+                if (v > 0) id(density_sg_raw).publish_state(v / 1000.0f);
               } else if (msg == 17 && x.size() >= 5) {  // RPM (uint32 big-endian)
                 uint32_t rpm = ((uint32_t)x[1] << 24) | ((uint32_t)x[2] << 16) |
                                ((uint32_t)x[3] << 8)  |  (uint32_t)x[4];
@@ -289,7 +293,22 @@ sensor:
     unit_of_measurement: "SG"
     accuracy_decimals: 4
     state_class: measurement
-    icon: mdi:cup-water     # request-driven (msg 33) -> no throttle needed
+    icon: mdi:cup-water
+    filters:
+      - sliding_window_moving_average:    # smooth measurement-to-measurement jitter
+          window_size: 4
+          send_every: 1
+  # Raw/uncalibrated SG straight from the sensor (msg 15) – NOT temperature/calibration
+  # corrected like "Specific gravity" (msg 14). Kept for interest/diagnostics.
+  - platform: template
+    name: "Specific gravity (raw)"
+    id: density_sg_raw
+    unit_of_measurement: "SG"
+    accuracy_decimals: 4
+    state_class: measurement
+    icon: mdi:cup-water-outline
+    filters:
+      - throttle: 5s
   # Uptime = reliable heartbeat: if it stalls in HA, the device is really gone.
   - platform: uptime
     name: "Uptime"
